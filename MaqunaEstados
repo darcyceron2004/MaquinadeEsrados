@@ -1,0 +1,260 @@
+#include "Arduino.h"
+#include "StateMachineLib.h"
+#include "AsyncTaskLib.h"
+#include <DHT.h>
+
+// ─── PINES ────────────────────────────────────────────────────────────────────
+#define ROJO_PIN     25
+#define VERDE_PIN    26
+#define AZUL_PIN     27
+#define PULSADOR_PIN 32
+#define SENSOR_DHT   4
+#define SENSOR_LUZ   34
+#define SENSOR_IR    33
+
+DHT sensorDHT(SENSOR_DHT, DHT22);
+
+// ─── ESTADOS ──────────────────────────────────────────────────────────────────
+enum EstadoSistema {
+  EST_REPOSO    = 0,
+  EST_MONLUZ    = 1,
+  EST_MONTEMP   = 2,
+  EST_MONHUMEDD = 3,
+  EST_ALERTA    = 4,
+  EST_ALARMA    = 5
+};
+
+// ─── ENTRADAS ─────────────────────────────────────────────────────────────────
+enum EntradaSistema {
+  ENT_BOTON    = 0,
+  ENT_INFRARROJO = 1,
+  ENT_LUZ      = 2,
+  ENT_HUMEDAD  = 3,
+  ENT_INFRARED = 4,
+  ENT_TEMP     = 5,
+  ENT_NINGUNA  = 6
+};
+EntradaSistema entradaActual = ENT_NINGUNA;
+
+volatile bool pulsadorPresionado = false;
+
+void IRAM_ATTR isrPulsador() {
+  pulsadorPresionado = true;
+}
+
+// ─── FLAGS DE TEMPORIZACIÓN ───────────────────────────────────────────────────
+bool tiempoLuzCumplido    = false;
+bool tiempoTempCumplido   = false;
+bool tiempoHumedCumplido  = false;
+bool tiempoAlertaCumplido = false;
+
+// ─── VARIABLES DE CONTROL ─────────────────────────────────────────────────────
+bool verdeEncendido = false;
+int  contadorFallos = 0;
+
+// ─── PROTOTIPOS ───────────────────────────────────────────────────────────────
+void actualizarSensores();
+void apagarTodosLeds();
+void estadoReposo();
+void estadoMonitorLuz();
+void estadoMonitorTemp();
+void estadoMonitorHumedad();
+void estadoAlerta();
+void estadoAlarma();
+void cbTiempoLuz();
+void cbTiempoTemp();
+void cbTiempoHumed();
+void cbTiempoAlerta();
+void cbToggleVerde();
+void cbIniciarRojo();
+void cbApagarRojo();
+void cbIniciarAzul();
+void cbApagarAzul();
+
+// ─── TAREAS ASÍNCRONAS ────────────────────────────────────────────────────────
+AsyncTask tareaTimerLuz    (3000, false, cbTiempoLuz);
+AsyncTask tareaTimerTemp   (6000, false, cbTiempoTemp);
+AsyncTask tareaTimerHumed  (4000, false, cbTiempoHumed);
+AsyncTask tareaTimerAlerta (4000, false, cbTiempoAlerta);
+
+// Verde: toggle cada 500ms (ON=500ms / OFF=500ms)
+AsyncTask tareaLedVerde    (500,  true,  cbToggleVerde);
+
+// Rojo: ON=100ms, OFF=300ms
+AsyncTask tareaRojoApagado (100,  false, cbApagarRojo);
+AsyncTask tareaRojoEncendido(300, false, cbIniciarRojo);
+
+// Azul: ON=300ms, OFF=900ms
+AsyncTask tareaAzulApagado (300,  false, cbApagarAzul);
+AsyncTask tareaAzulEncendido(900, false, cbIniciarAzul);
+
+AsyncTask tareaMuestreo    (1000, true,  actualizarSensores);
+
+// ─── MÁQUINA DE ESTADOS ───────────────────────────────────────────────────────
+StateMachine maquinaEstados(6, 13);
+
+// ─── CALLBACKS DE TIMERS ──────────────────────────────────────────────────────
+void cbTiempoLuz()    { tiempoLuzCumplido    = true; }
+void cbTiempoTemp()   { tiempoTempCumplido   = true; }
+void cbTiempoHumed()  { tiempoHumedCumplido  = true; }
+void cbTiempoAlerta() { tiempoAlertaCumplido = true; }
+
+// ─── CALLBACKS DE LEDS ────────────────────────────────────────────────────────
+void cbToggleVerde() {
+  verdeEncendido = !verdeEncendido;
+  digitalWrite(VERDE_PIN, verdeEncendido);
+}
+
+// Rojo: enciende 100ms → apaga → espera 300ms → repite
+void cbIniciarRojo() {
+  digitalWrite(ROJO_PIN, HIGH);
+  tareaRojoApagado.Start();
+}
+void cbApagarRojo() {
+  digitalWrite(ROJO_PIN, LOW);
+  tareaRojoEncendido.Start();
+}
+
+// Azul: enciende 300ms → apaga → espera 900ms → repite
+void cbIniciarAzul() {
+  digitalWrite(AZUL_PIN, HIGH);
+  tareaAzulApagado.Start();
+}
+void cbApagarAzul() {
+  digitalWrite(AZUL_PIN, LOW);
+  tareaAzulEncendido.Start();
+}
+
+// ─── LECTURA DE SENSORES ──────────────────────────────────────────────────────
+void actualizarSensores() {
+  float temperatura  = sensorDHT.readTemperature();
+  float humedad      = sensorDHT.readHumidity();
+  int   nivelLuz     = analogRead(SENSOR_LUZ);
+  bool  deteccionIR  = (digitalRead(SENSOR_IR) == HIGH);
+  bool  botonActivo  = pulsadorPresionado;
+  pulsadorPresionado = false;
+
+  if      (botonActivo)                              entradaActual = ENT_BOTON;
+  else if (deteccionIR)                              entradaActual = ENT_INFRARROJO;
+  else if (!isnan(temperatura) && temperatura > 25.0) entradaActual = ENT_TEMP;
+  else if (!isnan(humedad)     && humedad < 60.0)    entradaActual = ENT_HUMEDAD;
+  else if (nivelLuz > 2000)                          entradaActual = ENT_LUZ;
+  else                                               entradaActual = ENT_NINGUNA;
+
+  Serial.printf("[Lectura] T:%.1f H:%.1f L:%d => entrada:%d\n",
+                temperatura, humedad, nivelLuz, entradaActual);
+}
+
+// ─── UTILIDAD ─────────────────────────────────────────────────────────────────
+void apagarTodosLeds() {
+  tareaLedVerde.Stop();
+  tareaRojoEncendido.Stop();
+  tareaRojoApagado.Stop();
+  tareaAzulEncendido.Stop();
+  tareaAzulApagado.Stop();
+  verdeEncendido = false;
+  digitalWrite(ROJO_PIN,  LOW);
+  digitalWrite(VERDE_PIN, LOW);
+  digitalWrite(AZUL_PIN,  LOW);
+}
+
+// ─── ACCIONES POR ESTADO ──────────────────────────────────────────────────────
+void estadoReposo() {
+  Serial.println("==> REPOSO");
+  contadorFallos = 0;
+  apagarTodosLeds();
+  tareaLedVerde.Start();
+}
+
+void estadoMonitorLuz() {
+  Serial.println("==> MONITOR LUZ");
+  apagarTodosLeds();
+  tiempoLuzCumplido = false;
+  tareaTimerLuz.Start();
+}
+
+void estadoMonitorTemp() {
+  Serial.println("==> MONITOR TEMPERATURA");
+  apagarTodosLeds();
+  tiempoTempCumplido = false;
+  tareaTimerTemp.Start();
+}
+
+void estadoMonitorHumedad() {
+  Serial.println("==> MONITOR HUMEDAD");
+  apagarTodosLeds();
+  tiempoHumedCumplido = false;
+  tareaTimerHumed.Start();
+}
+
+void estadoAlerta() {
+  contadorFallos++;
+  Serial.println("==> ALERTA [" + String(contadorFallos) + "/3]");
+  apagarTodosLeds();
+  tiempoAlertaCumplido = false;
+  tareaTimerAlerta.Start();
+  tareaAzulEncendido.Start();
+}
+
+void estadoAlarma() {
+  Serial.println("==> ALARMA ACTIVA");
+  apagarTodosLeds();
+  digitalWrite(ROJO_PIN, HIGH);
+  tareaRojoApagado.Start();
+}
+
+// ─── CONFIGURAR FSM ───────────────────────────────────────────────────────────
+void configurarMaquina() {
+  maquinaEstados.AddTransition(EST_REPOSO,    EST_MONLUZ,    []() { return entradaActual == ENT_INFRARROJO; });
+  maquinaEstados.AddTransition(EST_MONLUZ,    EST_MONHUMEDD, []() { return entradaActual == ENT_BOTON; });
+  maquinaEstados.AddTransition(EST_MONLUZ,    EST_ALERTA,    []() { return entradaActual == ENT_LUZ; });
+  maquinaEstados.AddTransition(EST_MONHUMEDD, EST_ALERTA,    []() { return entradaActual == ENT_HUMEDAD; });
+  maquinaEstados.AddTransition(EST_MONTEMP,   EST_ALERTA,    []() { return entradaActual == ENT_TEMP; });
+  maquinaEstados.AddTransition(EST_MONTEMP,   EST_ALERTA,    []() { return entradaActual == ENT_LUZ; });
+  maquinaEstados.AddTransition(EST_ALERTA,    EST_MONHUMEDD, []() { return entradaActual == ENT_HUMEDAD; });
+  maquinaEstados.AddTransition(EST_ALERTA,    EST_ALARMA,    []() { return contadorFallos >= 3; });
+  maquinaEstados.AddTransition(EST_ALERTA,    EST_MONLUZ,    []() { return tiempoAlertaCumplido && contadorFallos < 3; });
+  maquinaEstados.AddTransition(EST_ALARMA,    EST_REPOSO,    []() { return entradaActual == ENT_BOTON; });
+  maquinaEstados.AddTransition(EST_MONLUZ,    EST_MONTEMP,   []() { return tiempoLuzCumplido; });
+  maquinaEstados.AddTransition(EST_MONTEMP,   EST_MONLUZ,    []() { return tiempoTempCumplido; });
+  maquinaEstados.AddTransition(EST_MONHUMEDD, EST_MONLUZ,    []() { return tiempoHumedCumplido; });
+
+  maquinaEstados.SetOnEntering(EST_REPOSO,    estadoReposo);
+  maquinaEstados.SetOnEntering(EST_MONLUZ,    estadoMonitorLuz);
+  maquinaEstados.SetOnEntering(EST_MONTEMP,   estadoMonitorTemp);
+  maquinaEstados.SetOnEntering(EST_MONHUMEDD, estadoMonitorHumedad);
+  maquinaEstados.SetOnEntering(EST_ALERTA,    estadoAlerta);
+  maquinaEstados.SetOnEntering(EST_ALARMA,    estadoAlarma);
+}
+
+// ─── SETUP ────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  sensorDHT.begin();
+  pinMode(ROJO_PIN,     OUTPUT);
+  pinMode(VERDE_PIN,    OUTPUT);
+  pinMode(AZUL_PIN,     OUTPUT);
+  pinMode(PULSADOR_PIN, INPUT_PULLUP);
+  pinMode(SENSOR_IR,    INPUT);
+  attachInterrupt(digitalPinToInterrupt(PULSADOR_PIN), isrPulsador, FALLING);
+  configurarMaquina();
+  maquinaEstados.SetState(EST_REPOSO, false, true);
+  tareaMuestreo.Start();
+  Serial.println("Sistema listo.");
+}
+
+// ─── LOOP ─────────────────────────────────────────────────────────────────────
+void loop() {
+  tareaMuestreo.Update();
+  tareaTimerLuz.Update();
+  tareaTimerTemp.Update();
+  tareaTimerHumed.Update();
+  tareaTimerAlerta.Update();
+  tareaLedVerde.Update();
+  tareaRojoEncendido.Update();
+  tareaRojoApagado.Update();
+  tareaAzulEncendido.Update();
+  tareaAzulApagado.Update();
+  maquinaEstados.Update();
+  entradaActual = ENT_NINGUNA;
+}
